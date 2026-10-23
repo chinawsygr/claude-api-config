@@ -1,0 +1,10 @@
+{
+  "name": "claude-api-config",
+  "displayName": "Claude API 配置",
+  "version": "1.0.0",
+  "description": "可视化管理 ~/.claude/settings.json 中的 ANTHROPIC_BASE_URL 与 ANTHROPIC_AUTH_TOKEN，支持历史版本记录与一键恢复。",
+  "type": "module",
+  "slot": "tab",
+  "entry": "dist/index.js",
+  "server": "dist/server.js"
+}

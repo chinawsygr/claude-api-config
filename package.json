@@ -1,0 +1,20 @@
+{
+  "name": "claude-api-config",
+  "version": "1.0.0",
+  "description": "CloudCLI plugin: edit ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN in ~/.claude/settings.json with history and restore.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "files": [
+    "manifest.json",
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2"
+  }
+}
