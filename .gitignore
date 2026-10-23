@@ -1,5 +1,7 @@
 node_modules/
 dist/
+# 插件运行时数据（历史备份），插件目录即仓库目录时会生成在这里
+data/
 *.log
 .DS_Store
 Thumbs.db
