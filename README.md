@@ -2,7 +2,16 @@
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](./LICENSE)
 
-CloudCLI 插件：可视化管理 `~/.claude/settings.json` 中的 `ANTHROPIC_BASE_URL` 与 `ANTHROPIC_AUTH_TOKEN`，支持历史版本记录与一键恢复。
+CloudCLI 插件：可视化管理 `~/.claude/settings.json` 中的 `ANTHROPIC_BASE_URL` 与 `ANTHROPIC_AUTH_TOKEN`，支持历史版本记录与一键恢复，并附带 **Token 用量统计** 与 **配置变更日志**。
+
+## 功能
+
+| 区块 | 说明 |
+| --- | --- |
+| 配置编辑 | 读写 `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`，保留 settings.json 其他所有字段 |
+| 历史记录 | 每次保存/恢复前自动备份，最多 20 份，一键回滚 |
+| Token 用量 | 汇总 `~/.claude/projects/**/*.jsonl` 的 usage，按天/按模型统计，支持 全部 / 30 天 / 7 天 |
+| 变更日志 | 记录每次保存与恢复的前后值（令牌脱敏为 `sk-****abcd`），最多 500 条 |
 
 ## 定位（重要）
 
@@ -73,6 +82,8 @@ npm run watch      # 监听编译
 | 目标配置 | `~/.claude/settings.json` |
 | 插件数据 | `~/.claude-code-ui/plugins/claude-api-config/data` |
 | 历史备份 | 上述 `data/history/settings-{ISO时间戳}.json`（最多 20 份，超出删最旧） |
+| 变更日志 | 上述 `data/changelog.jsonl`（最多 500 条） |
+| 用量来源 | `~/.claude/projects/**/*.jsonl`（只读） |
 
 ## 接口
 
@@ -82,8 +93,22 @@ npm run watch      # 监听编译
 | POST | `/api/config` | 入参 `{ baseUrl, authToken }`，校验后备份并写回，保留其他所有字段 |
 | GET | `/api/history` | 返回 `[{ filename, timestamp, baseUrl }]`，按文件名倒序 |
 | POST | `/api/restore` | 入参 `{ filename }`，先备份当前配置，再把历史内容原样写回 |
+| GET | `/api/usage?range=all\|30d\|7d` | 返回 token 用量聚合：`totals` / `byDay` / `byModel` / `sessions` / `messages` / `files` |
+| GET | `/api/changelog?limit=50` | 返回变更日志，最新在前（最多 500 条） |
 
-宿主把 `api.rpc('GET', '/api/config')` 原样转发到插件服务器，因此上述路径可直接使用；同时兼容不带 `/api` 前缀的 `/config`、`/history`、`/restore`。
+宿主把 `api.rpc('GET', '/api/config')` 原样转发到插件服务器，因此上述路径可直接使用；同时兼容不带 `/api` 前缀的 `/config`、`/history`、`/restore`、`/usage`、`/changelog`。
+
+### Token 用量统计口径
+
+- 数据来源：`~/.claude/projects/<project>/<session>.jsonl` 中 `type === "assistant"` 记录的 `message.usage`
+- 同一条助手消息在日志里可能被拆成多行、每行重复完整 usage，因此**按 `message.id` 去重**
+- 四类计数：`input_tokens`、`output_tokens`、`cache_creation_input_tokens`、`cache_read_input_tokens`；合计为四者之和
+- `<synthetic>` 等零用量记录被忽略
+- 结果在内存缓存 30 秒；`7d` / `30d` 会先用文件 mtime 做快速过滤
+
+### 变更日志脱敏
+
+只保留令牌首 3 位与末 4 位（`sk-****abcd`），完整令牌永不写入日志；日志落在 `data/changelog.jsonl`。
 
 ## 边界处理
 

@@ -82,3 +82,67 @@ export interface RestoreResponse {
 export interface ErrorResponse {
   error: string;
 }
+
+/* ------------------------------------------------------------------ */
+/* Token 用量统计                                                      */
+/* ------------------------------------------------------------------ */
+
+/** 一组 token 计数 */
+export interface UsageTotals {
+  /** 输入 token */
+  input: number;
+  /** 输出 token */
+  output: number;
+  /** 缓存写入 token */
+  cacheCreate: number;
+  /** 缓存读取 token */
+  cacheRead: number;
+  /** 四项之和 */
+  total: number;
+}
+
+/** 按天聚合 */
+export interface UsageDayBucket extends UsageTotals {
+  /** 本地日期 YYYY-MM-DD */
+  date: string;
+}
+
+/** 按模型聚合 */
+export interface UsageModelBucket extends UsageTotals {
+  model: string;
+}
+
+/** `GET /api/usage` 返回体 */
+export interface UsageReport {
+  /** 生效的时间范围：all / 30d / 7d */
+  range: string;
+  totals: UsageTotals;
+  /** 按天，最新在前 */
+  byDay: UsageDayBucket[];
+  /** 按模型，总量降序 */
+  byModel: UsageModelBucket[];
+  /** 有 token 记录的会话数 */
+  sessions: number;
+  /** 计入统计的助手消息数（已按 message.id 去重） */
+  messages: number;
+  /** 实际扫描的日志文件数 */
+  files: number;
+  /** 统计时间 */
+  scannedAt: string;
+}
+
+/* ------------------------------------------------------------------ */
+/* 配置变更日志                                                        */
+/* ------------------------------------------------------------------ */
+
+/** 单条变更记录（令牌字段均已脱敏） */
+export interface ChangeLogEntry {
+  /** ISO 时间 */
+  at: string;
+  /** save = 保存配置，restore = 从历史恢复 */
+  action: 'save' | 'restore';
+  /** restore 时对应的历史文件名 */
+  filename?: string;
+  baseUrl: { from: string; to: string };
+  authToken: { from: string; to: string };
+}

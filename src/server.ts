@@ -12,16 +12,19 @@
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { promises as fs } from 'node:fs';
+import { createReadStream, promises as fs } from 'node:fs';
+import { createInterface } from 'node:readline';
 import path from 'node:path';
 import os from 'node:os';
 
 import type {
+  ChangeLogEntry,
   ConfigResponse,
   ErrorResponse,
   HistoryItem,
   RestoreResponse,
   SaveConfigResponse,
+  UsageReport,
 } from './types.js';
 
 /* ------------------------------------------------------------------ */
@@ -49,6 +52,18 @@ const DATA_DIR = path.join(
 
 /** 历史备份目录 */
 const HISTORY_DIR = path.join(DATA_DIR, 'history');
+
+/** 变更日志文件（JSONL，追加写） */
+const CHANGELOG_PATH = path.join(DATA_DIR, 'changelog.jsonl');
+
+/** 变更日志保留条数 */
+const MAX_CHANGELOG = 500;
+
+/** Claude Code 会话日志目录：~/.claude/projects/<project>/<session>.jsonl */
+const PROJECTS_DIR = path.join(HOME, '.claude', 'projects');
+
+/** 用量统计结果缓存时间（避免每次切 tab 都全量扫描） */
+const USAGE_CACHE_TTL = 30_000;
 
 /** 历史最多保留份数 */
 const MAX_HISTORY = 20;
@@ -299,6 +314,278 @@ function assertValidBaseUrl(value: string): void {
 }
 
 /* ------------------------------------------------------------------ */
+/* 变更日志                                                            */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 令牌脱敏：只保留首 3 位与末 4 位，其余用 * 替代。
+ * 变更日志永远只记录脱敏后的值，绝不落盘完整令牌。
+ */
+function maskToken(token: string): string {
+  if (token === '') return '';
+  if (token.length <= 8) return '****';
+  return `${token.slice(0, 3)}****${token.slice(-4)}`;
+}
+
+/** 追加一条变更日志，必要时裁剪到 MAX_CHANGELOG 条 */
+async function appendChangeLog(entry: ChangeLogEntry): Promise<void> {
+  const line = `${JSON.stringify(entry)}\n`;
+  try {
+    await fs.mkdir(DATA_DIR, { recursive: true });
+    await fs.appendFile(CHANGELOG_PATH, line, 'utf8');
+  } catch (err) {
+    // 日志写失败不影响主流程，仅记录到 stderr
+    process.stderr.write(`[claude-api-config] changelog append failed: ${errorMessage(err)}\n`);
+    return;
+  }
+
+  // 文件超过 256KB 时裁剪，避免无限增长
+  try {
+    const stat = await fs.stat(CHANGELOG_PATH);
+    if (stat.size <= 256 * 1024) return;
+    const raw = await fs.readFile(CHANGELOG_PATH, 'utf8');
+    const lines = raw.split('\n').filter((l) => l.trim() !== '');
+    const kept = lines.slice(-MAX_CHANGELOG);
+    await fs.writeFile(CHANGELOG_PATH, kept.map((l) => `${l}\n`).join(''), 'utf8');
+  } catch {
+    // 裁剪失败忽略
+  }
+}
+
+/** 读取变更日志，返回最新在前的数组 */
+async function readChangeLog(limit: number): Promise<ChangeLogEntry[]> {
+  let raw: string;
+  try {
+    raw = await fs.readFile(CHANGELOG_PATH, 'utf8');
+  } catch (err) {
+    if (errorCode(err) === 'ENOENT') return [];
+    throw new HttpError(500, `读取变更日志失败：${errorMessage(err)}`);
+  }
+
+  const entries: ChangeLogEntry[] = [];
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed === '') continue;
+    try {
+      const parsed: unknown = JSON.parse(trimmed);
+      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        entries.push(parsed as ChangeLogEntry);
+      }
+    } catch {
+      // 单行损坏跳过
+    }
+  }
+  entries.reverse();
+  return entries.slice(0, limit);
+}
+
+/* ------------------------------------------------------------------ */
+/* Token 用量统计                                                      */
+/* ------------------------------------------------------------------ */
+
+interface UsageTotals {
+  input: number;
+  output: number;
+  cacheCreate: number;
+  cacheRead: number;
+  total: number;
+}
+
+function emptyTotals(): UsageTotals {
+  return { input: 0, output: 0, cacheCreate: 0, cacheRead: 0, total: 0 };
+}
+
+function addTotals(target: UsageTotals, source: UsageTotals): void {
+  target.input += source.input;
+  target.output += source.output;
+  target.cacheCreate += source.cacheCreate;
+  target.cacheRead += source.cacheRead;
+  target.total += source.total;
+}
+
+/** 本地日期 YYYY-MM-DD */
+function localDay(date: Date): string {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+/** 递归列出 ~/.claude/projects 下的所有 *.jsonl 会话文件 */
+async function listSessionFiles(): Promise<Array<{ file: string; project: string; session: string }>> {
+  let projectDirs: string[];
+  try {
+    projectDirs = await fs.readdir(PROJECTS_DIR);
+  } catch (err) {
+    if (errorCode(err) === 'ENOENT') return [];
+    throw new HttpError(500, `读取会话目录失败：${errorMessage(err)}`);
+  }
+
+  const result: Array<{ file: string; project: string; session: string }> = [];
+  for (const project of projectDirs) {
+    const projectPath = path.join(PROJECTS_DIR, project);
+    let entries: Array<{ name: string; isFile: () => boolean }>;
+    try {
+      entries = await fs.readdir(projectPath, { withFileTypes: true });
+    } catch {
+      continue; // 不是目录或无权限，跳过
+    }
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue;
+      result.push({
+        file: path.join(projectPath, entry.name),
+        project,
+        session: entry.name.replace(/\.jsonl$/, ''),
+      });
+    }
+  }
+  return result;
+}
+
+/** 从单条 usage 中取出各项 token */
+function readUsage(raw: unknown): UsageTotals | null {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const usage = raw as Record<string, unknown>;
+  const num = (key: string): number => {
+    const value = usage[key];
+    return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0;
+  };
+  const input = num('input_tokens');
+  const output = num('output_tokens');
+  const cacheCreate = num('cache_creation_input_tokens');
+  const cacheRead = num('cache_read_input_tokens');
+  if (input === 0 && output === 0 && cacheCreate === 0 && cacheRead === 0) return null;
+  return { input, output, cacheCreate, cacheRead, total: input + output + cacheCreate + cacheRead };
+}
+
+const RANGE_DAYS: Record<string, number | null> = { '7d': 7, '30d': 30, all: null };
+
+let usageCache: { key: string; at: number; data: UsageReport } | null = null;
+
+/** 扫描所有会话日志，按天 / 按模型聚合 token 用量 */
+async function buildUsageReport(range: string): Promise<UsageReport> {
+  const days = RANGE_DAYS[range] ?? null;
+  const cacheKey = `${range}`;
+  if (usageCache !== null && usageCache.key === cacheKey && Date.now() - usageCache.at < USAGE_CACHE_TTL) {
+    return usageCache.data;
+  }
+
+  const cutoff = days === null ? null : Date.now() - days * 24 * 60 * 60 * 1000;
+  const files = await listSessionFiles();
+
+  const totals = emptyTotals();
+  const dayMap = new Map<string, UsageTotals>();
+  const modelMap = new Map<string, UsageTotals>();
+  const seenMessageIds = new Set<string>();
+  let sessions = 0;
+  let messages = 0;
+  let scannedFiles = 0;
+
+  for (const item of files) {
+    // 范围过滤的快速路径：文件修改时间早于窗口起点就整份跳过
+    if (cutoff !== null) {
+      try {
+        const stat = await fs.stat(item.file);
+        if (stat.mtimeMs < cutoff - 24 * 60 * 60 * 1000) continue;
+      } catch {
+        continue;
+      }
+    }
+
+    scannedFiles += 1;
+    let sessionCounted = false;
+    const before = { ...totals };
+
+    try {
+      const stream = createReadStream(item.file, { encoding: 'utf8' });
+      const rl = createInterface({ input: stream, crlfDelay: Infinity });
+      for await (const line of rl) {
+        if (line.trim() === '') continue;
+        let record: unknown;
+        try {
+          record = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (record === null || typeof record !== 'object') continue;
+        const row = record as Record<string, unknown>;
+        if (row.type !== 'assistant') continue;
+
+        const message = row.message;
+        if (message === null || typeof message !== 'object') continue;
+        const msg = message as Record<string, unknown>;
+        const usage = readUsage(msg.usage);
+        if (usage === null) continue;
+
+        // 同一条助手消息可能被拆成多行（每行重复完整 usage），按 message.id 去重
+        const id = typeof msg.id === 'string' ? msg.id : '';
+        if (id !== '') {
+          if (seenMessageIds.has(id)) continue;
+          seenMessageIds.add(id);
+        }
+
+        const timestamp = typeof row.timestamp === 'string' ? row.timestamp : '';
+        const at = timestamp === '' ? null : new Date(timestamp);
+        if (at !== null && !Number.isNaN(at.getTime())) {
+          if (cutoff !== null && at.getTime() < cutoff) continue;
+        }
+
+        const model = typeof msg.model === 'string' && msg.model !== '' ? msg.model : 'unknown';
+
+        addTotals(totals, usage);
+        if (at !== null && !Number.isNaN(at.getTime())) {
+          const day = localDay(at);
+          const bucket = dayMap.get(day) ?? emptyTotals();
+          addTotals(bucket, usage);
+          dayMap.set(day, bucket);
+        }
+        const modelBucket = modelMap.get(model) ?? emptyTotals();
+        addTotals(modelBucket, usage);
+        modelMap.set(model, modelBucket);
+
+        messages += 1;
+        sessionCounted = true;
+      }
+      rl.close();
+      stream.destroy();
+    } catch (err) {
+      process.stderr.write(`[claude-api-config] read ${item.file} failed: ${errorMessage(err)}\n`);
+      // 回滚该文件已累加的部分，避免半份数据
+      totals.input = before.input;
+      totals.output = before.output;
+      totals.cacheCreate = before.cacheCreate;
+      totals.cacheRead = before.cacheRead;
+      totals.total = before.total;
+      sessionCounted = false;
+    }
+
+    if (sessionCounted) sessions += 1;
+  }
+
+  const byDay = [...dayMap.entries()]
+    .map(([date, value]) => ({ date, ...value }))
+    .sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
+
+  const byModel = [...modelMap.entries()]
+    .map(([model, value]) => ({ model, ...value }))
+    .sort((a, b) => b.total - a.total);
+
+  const report: UsageReport = {
+    range: days === null ? 'all' : `${days}d`,
+    totals,
+    byDay,
+    byModel,
+    sessions,
+    messages,
+    files: scannedFiles,
+    scannedAt: new Date().toISOString(),
+  };
+
+  usageCache = { key: cacheKey, at: Date.now(), data: report };
+  return report;
+}
+
+/* ------------------------------------------------------------------ */
 /* HTTP 工具                                                           */
 /* ------------------------------------------------------------------ */
 
@@ -387,11 +674,20 @@ async function handleSaveConfig(req: IncomingMessage, res: ServerResponse): Prom
 
   const current = await readSettings();
   const settings = current.data;
+  const previousBaseUrl = readEnvString(settings, ENV_BASE_URL);
+  const previousToken = readEnvString(settings, ENV_AUTH_TOKEN);
   const env = ensureEnvObject(settings);
   env[ENV_BASE_URL] = baseUrl;
   env[ENV_AUTH_TOKEN] = authToken;
 
   await writeSettings(settings);
+
+  await appendChangeLog({
+    at: new Date().toISOString(),
+    action: 'save',
+    baseUrl: { from: previousBaseUrl, to: baseUrl },
+    authToken: { from: maskToken(previousToken), to: maskToken(authToken) },
+  });
 
   const payload: SaveConfigResponse = { success: true };
   sendJson(res, 200, payload);
@@ -449,11 +745,48 @@ async function handleRestore(req: IncomingMessage, res: ServerResponse): Promise
   // 先备份当前配置（损坏的 settings.json 会在此被拒绝，不会覆盖）
   await backupCurrentSettings();
 
+  const before = await readSettings();
+  const beforeBaseUrl = readEnvString(before.data, ENV_BASE_URL);
+  const beforeToken = readEnvString(before.data, ENV_AUTH_TOKEN);
+
   // 再把历史文件内容原样写回
   await writeSettingsRaw(content);
 
+  let afterBaseUrl = '';
+  let afterToken = '';
+  try {
+    const after = await readSettings();
+    afterBaseUrl = readEnvString(after.data, ENV_BASE_URL);
+    afterToken = readEnvString(after.data, ENV_AUTH_TOKEN);
+  } catch {
+    // 历史内容可解析（前面已校验），此处异常仅影响日志展示
+  }
+
+  await appendChangeLog({
+    at: new Date().toISOString(),
+    action: 'restore',
+    filename,
+    baseUrl: { from: beforeBaseUrl, to: afterBaseUrl },
+    authToken: { from: maskToken(beforeToken), to: maskToken(afterToken) },
+  });
+
   const payload: RestoreResponse = { success: true };
   sendJson(res, 200, payload);
+}
+
+/** GET /api/usage?range=all|30d|7d */
+async function handleGetUsage(res: ServerResponse, range: string): Promise<void> {
+  const normalized = range === '7d' || range === '30d' ? range : 'all';
+  const report = await buildUsageReport(normalized);
+  sendJson(res, 200, report);
+}
+
+/** GET /api/changelog?limit=50 */
+async function handleGetChangeLog(res: ServerResponse, limitRaw: string): Promise<void> {
+  const parsed = Number.parseInt(limitRaw, 10);
+  const limit = Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, MAX_CHANGELOG) : 50;
+  const entries = await readChangeLog(limit);
+  sendJson(res, 200, entries);
 }
 
 /* ------------------------------------------------------------------ */
@@ -495,6 +828,14 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   }
   if (isRoute(pathname, 'restore') && method === 'POST') {
     await handleRestore(req, res);
+    return;
+  }
+  if (isRoute(pathname, 'usage') && method === 'GET') {
+    await handleGetUsage(res, url.searchParams.get('range') ?? 'all');
+    return;
+  }
+  if (isRoute(pathname, 'changelog') && method === 'GET') {
+    await handleGetChangeLog(res, url.searchParams.get('limit') ?? '50');
     return;
   }
 
