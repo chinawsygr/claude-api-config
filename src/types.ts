@@ -7,28 +7,34 @@
  * - 不拦截、不代理任何 API 请求
  * - 不控制 Claude Code 进程生命周期
  * - 保存或恢复后，已运行的 Claude Code 会话不会热切换，需要新建会话或重启进程才生效
+ *
+ * PluginContext / PluginAPI 与 CloudCLI 官方 docs/plugins/frontend-api 保持一致。
  */
 
-/** 插件宿主注入的上下文。字段按宿主实际提供为准，此处仅声明本插件可能读取的部分。 */
+/** 宿主注入的上下文（官方结构） */
 export interface PluginContext {
-  /** 当前主题，用于适配深色/浅色 */
-  readonly theme?: 'light' | 'dark';
-  /** 当前语言 */
-  readonly locale?: string;
-  /** 当前工作区路径（本插件不依赖，仅保留） */
-  readonly workspacePath?: string;
-  /** 宿主可能扩展的其他字段 */
-  readonly [key: string]: unknown;
+  /** 当前主题，随用户切换实时变化 */
+  theme: 'dark' | 'light';
+  /** 当前选中的项目，未选中为 null */
+  project: { name: string; path: string } | null;
+  /** 当前会话，无会话为 null */
+  session: { id: string; title: string } | null;
 }
 
-/** 宿主通过 mount(container, api) 注入的前端 API。 */
+/** 宿主通过 mount(container, api) 注入的前端 API */
 export interface PluginAPI {
-  /** 当前上下文（只读） */
+  /** 当前上下文（每次访问都返回最新值） */
   readonly context: PluginContext;
-  /** 订阅上下文变化，返回取消订阅函数 */
-  onContextChange(listener: (context: PluginContext) => void): () => void;
-  /** 调用本插件后端接口，method 为大写 HTTP 方法（GET/POST…），path 以 `/api/` 开头 */
+  /** 订阅上下文变化，返回取消订阅函数（订阅时不会立即回调） */
+  onContextChange(callback: (context: PluginContext) => void): () => void;
+  /** 调用插件后端；path 前导斜杠会被剥离，按同路径转发到插件服务器 */
   rpc<T = unknown>(method: string, path: string, body?: unknown): Promise<T>;
+}
+
+/** 插件入口模块导出 */
+export interface PluginModule {
+  mount(container: HTMLElement, api: PluginAPI): void | Promise<void>;
+  unmount?(container: HTMLElement): void;
 }
 
 /** `GET /api/config` 返回体 */

@@ -28,12 +28,19 @@ import type {
 /* 常量                                                                */
 /* ------------------------------------------------------------------ */
 
+/**
+ * 用户主目录。
+ * CloudCLI 只向插件进程透传 PATH / HOME / NODE_ENV / PLUGIN_NAME，
+ * Windows 上 os.homedir() 依赖 USERPROFILE，故显式按优先级回退。
+ */
+const HOME = process.env.HOME || process.env.USERPROFILE || os.homedir();
+
 /** 目标配置文件：~/.claude/settings.json */
-const SETTINGS_PATH = path.join(os.homedir(), '.claude', 'settings.json');
+const SETTINGS_PATH = path.join(HOME, '.claude', 'settings.json');
 
 /** 插件数据目录：~/.claude-code-ui/plugins/claude-api-config/data */
 const DATA_DIR = path.join(
-  os.homedir(),
+  HOME,
   '.claude-code-ui',
   'plugins',
   'claude-api-config',
@@ -453,6 +460,15 @@ async function handleRestore(req: IncomingMessage, res: ServerResponse): Promise
 /* 服务启动                                                            */
 /* ------------------------------------------------------------------ */
 
+/**
+ * 路由匹配。
+ * 宿主把 `api.rpc('GET', '/api/config')` 原样转发过来，因此服务器收到 `/api/config`；
+ * 同时兼容不带 `/api` 前缀的写法（`/config`）。
+ */
+function isRoute(pathname: string, name: string): boolean {
+  return pathname === `/api/${name}` || pathname === `/${name}`;
+}
+
 async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const method = (req.method ?? 'GET').toUpperCase();
   const url = new URL(req.url ?? '/', 'http://127.0.0.1');
@@ -465,19 +481,19 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     return;
   }
 
-  if (pathname === '/api/config' && method === 'GET') {
+  if (isRoute(pathname, 'config') && method === 'GET') {
     await handleGetConfig(res);
     return;
   }
-  if (pathname === '/api/config' && method === 'POST') {
+  if (isRoute(pathname, 'config') && method === 'POST') {
     await handleSaveConfig(req, res);
     return;
   }
-  if (pathname === '/api/history' && method === 'GET') {
+  if (isRoute(pathname, 'history') && method === 'GET') {
     await handleGetHistory(res);
     return;
   }
-  if (pathname === '/api/restore' && method === 'POST') {
+  if (isRoute(pathname, 'restore') && method === 'POST') {
     await handleRestore(req, res);
     return;
   }

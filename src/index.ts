@@ -8,7 +8,8 @@
  * - 不控制 Claude Code 进程生命周期
  * - 保存或恢复后，已运行的 Claude Code 会话不会热切换，需要新建会话或重启进程才生效
  *
- * 实现约束：不引入 UI 框架，全部使用原生 DOM + 行内样式。
+ * 实现约束：不引入 UI 框架，全部使用原生 DOM + 行内样式；
+ * 配色跟随 `api.context.theme`（CloudCLI 官方提供的 dark / light）。
  */
 
 import type {
@@ -16,6 +17,7 @@ import type {
   ErrorResponse,
   HistoryItem,
   PluginAPI,
+  PluginContext,
   RestoreResponse,
   SaveConfigResponse,
 } from './types.js';
@@ -24,25 +26,56 @@ import type {
 /* 主题                                                                */
 /* ------------------------------------------------------------------ */
 
-/**
- * 深色主题优先的可读配色。
- * 优先使用宿主提供的 CSS 变量（若存在），否则回退到深色主题下可读的固定色值。
- */
-const COLOR = {
-  fg: 'var(--cli-foreground, #e4e4e7)',
-  muted: 'var(--cli-muted-foreground, #a1a1aa)',
-  border: 'var(--cli-border, #3f3f46)',
-  inputBg: 'var(--cli-input-background, rgba(255, 255, 255, 0.06))',
-  panelBg: 'var(--cli-panel-background, rgba(255, 255, 255, 0.03))',
-  accent: 'var(--cli-accent, #3b82f6)',
-  accentFg: 'var(--cli-accent-foreground, #ffffff)',
-  successBg: 'rgba(22, 163, 74, 0.18)',
-  successBorder: 'rgba(34, 197, 94, 0.55)',
-  successFg: '#4ade80',
-  errorBg: 'rgba(220, 38, 38, 0.18)',
-  errorBorder: 'rgba(248, 113, 113, 0.55)',
-  errorFg: '#f87171',
-} as const;
+type Theme = 'dark' | 'light';
+
+interface Palette {
+  fg: string;
+  muted: string;
+  border: string;
+  inputBg: string;
+  panelBg: string;
+  accent: string;
+  accentFg: string;
+  successBg: string;
+  successBorder: string;
+  successFg: string;
+  errorBg: string;
+  errorBorder: string;
+  errorFg: string;
+}
+
+const PALETTES: Record<Theme, Palette> = {
+  dark: {
+    fg: '#e4e4e7',
+    muted: '#a1a1aa',
+    border: '#3f3f46',
+    inputBg: 'rgba(255, 255, 255, 0.06)',
+    panelBg: 'rgba(255, 255, 255, 0.03)',
+    accent: '#3b82f6',
+    accentFg: '#ffffff',
+    successBg: 'rgba(22, 163, 74, 0.18)',
+    successBorder: 'rgba(34, 197, 94, 0.55)',
+    successFg: '#4ade80',
+    errorBg: 'rgba(220, 38, 38, 0.18)',
+    errorBorder: 'rgba(248, 113, 113, 0.55)',
+    errorFg: '#f87171',
+  },
+  light: {
+    fg: '#1f2328',
+    muted: '#656d76',
+    border: '#d0d7de',
+    inputBg: '#ffffff',
+    panelBg: '#f6f8fa',
+    accent: '#0969da',
+    accentFg: '#ffffff',
+    successBg: '#dafbe1',
+    successBorder: '#4ac26b',
+    successFg: '#1a7f37',
+    errorBg: '#ffebe9',
+    errorBorder: '#ff8182',
+    errorFg: '#cf222e',
+  },
+};
 
 const FONT =
   '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "PingFang SC", "Microsoft YaHei", sans-serif';
@@ -69,7 +102,7 @@ function el<K extends keyof HTMLElementTagNameMap>(
 }
 
 function errMessage(err: unknown): string {
-  if (err instanceof Error) return err.message;
+  if (err instanceof Error && err.message !== '') return err.message;
   if (typeof err === 'object' && err !== null && 'error' in err) {
     const message = (err as ErrorResponse).error;
     if (typeof message === 'string' && message !== '') return message;
@@ -94,65 +127,39 @@ let mounted: MountedView | null = null;
 /* ------------------------------------------------------------------ */
 
 export function mount(container: HTMLElement, api: PluginAPI): void {
+  // 宿主每次切到该 tab 都会调用 mount，先清掉上一次的 DOM 与监听
   unmount();
 
+  let theme: Theme = api.context.theme === 'light' ? 'light' : 'dark';
+  let palette: Palette = PALETTES[theme];
+
+  /* ---------- 结构 ---------- */
   const root = el('div', {
     fontFamily: FONT,
     fontSize: '13px',
     lineHeight: '1.6',
-    color: COLOR.fg,
     padding: '20px',
     boxSizing: 'border-box',
     maxWidth: '820px',
     textAlign: 'left',
   });
 
-  /* ---------- 标题 ---------- */
-  const title = el(
-    'h2',
-    { margin: '0 0 6px', fontSize: '17px', fontWeight: '600', color: COLOR.fg },
-    'Claude API 配置',
-  );
+  const title = el('h2', { margin: '0 0 6px', fontSize: '17px', fontWeight: '600' }, 'Claude API 配置');
+  const subtitle = el('p', { margin: '0 0 16px', fontSize: '12px', lineHeight: '1.6' }, NOTICE);
 
-  const subtitle = el(
-    'p',
-    { margin: '0 0 16px', fontSize: '12px', lineHeight: '1.6', color: COLOR.muted },
-    NOTICE,
-  );
-
-  /* ---------- 状态提示条 ---------- */
   const status = el('div', {
     display: 'none',
     margin: '0 0 14px',
     padding: '8px 12px',
     borderRadius: '6px',
-    border: '1px solid transparent',
+    borderWidth: '1px',
+    borderStyle: 'solid',
     fontSize: '12px',
     lineHeight: '1.5',
     whiteSpace: 'pre-wrap',
     wordBreak: 'break-word',
   });
 
-  function showStatus(kind: 'success' | 'error', message: string): void {
-    status.textContent = message;
-    status.style.display = 'block';
-    if (kind === 'success') {
-      status.style.background = COLOR.successBg;
-      status.style.borderColor = COLOR.successBorder;
-      status.style.color = COLOR.successFg;
-    } else {
-      status.style.background = COLOR.errorBg;
-      status.style.borderColor = COLOR.errorBorder;
-      status.style.color = COLOR.errorFg;
-    }
-  }
-
-  function hideStatus(): void {
-    status.style.display = 'none';
-    status.textContent = '';
-  }
-
-  /* ---------- 表单 ---------- */
   const baseUrlInput = el('input', {
     display: 'block',
     width: '100%',
@@ -160,12 +167,10 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
     padding: '8px 10px',
     fontSize: '13px',
     fontFamily: MONO,
-    color: COLOR.fg,
-    background: COLOR.inputBg,
-    border: `1px solid ${COLOR.border}`,
     borderRadius: '6px',
+    borderWidth: '1px',
+    borderStyle: 'solid',
     outline: 'none',
-    caretColor: COLOR.fg,
   });
   baseUrlInput.type = 'text';
   baseUrlInput.placeholder = 'https://api.deepseek.com/anthropic';
@@ -179,37 +184,32 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
     padding: '8px 10px',
     fontSize: '13px',
     fontFamily: MONO,
-    color: COLOR.fg,
-    background: COLOR.inputBg,
-    border: `1px solid ${COLOR.border}`,
     borderRadius: '6px',
+    borderWidth: '1px',
+    borderStyle: 'solid',
     outline: 'none',
-    caretColor: COLOR.fg,
   });
   authTokenInput.type = 'password';
   authTokenInput.placeholder = 'sk-...';
   authTokenInput.spellcheck = false;
   authTokenInput.autocomplete = 'off';
 
-  function field(labelText: string, input: HTMLElement): HTMLDivElement {
-    const wrap = el('div', { marginBottom: '14px' });
-    const label = el(
-      'label',
-      {
-        display: 'block',
-        marginBottom: '6px',
-        fontSize: '12px',
-        fontFamily: MONO,
-        color: COLOR.muted,
-      },
-      labelText,
-    );
-    wrap.append(label, input);
-    return wrap;
-  }
+  const baseUrlLabel = el(
+    'label',
+    { display: 'block', marginBottom: '6px', fontSize: '12px', fontFamily: MONO },
+    'ANTHROPIC_BASE_URL',
+  );
+  const authTokenLabel = el(
+    'label',
+    { display: 'block', marginBottom: '6px', fontSize: '12px', fontFamily: MONO },
+    'ANTHROPIC_AUTH_TOKEN',
+  );
 
-  const baseUrlField = field('ANTHROPIC_BASE_URL', baseUrlInput);
-  const authTokenField = field('ANTHROPIC_AUTH_TOKEN', authTokenInput);
+  const baseUrlField = el('div', { marginBottom: '14px' });
+  baseUrlField.append(baseUrlLabel, baseUrlInput);
+
+  const authTokenField = el('div', { marginBottom: '14px' });
+  authTokenField.append(authTokenLabel, authTokenInput);
 
   const saveButton = el(
     'button',
@@ -217,9 +217,9 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
       padding: '8px 18px',
       fontSize: '13px',
       fontWeight: '500',
-      color: COLOR.accentFg,
-      background: COLOR.accent,
-      border: '1px solid transparent',
+      borderWidth: '1px',
+      borderStyle: 'solid',
+      borderColor: 'transparent',
       borderRadius: '6px',
       cursor: 'pointer',
       transition: 'opacity 120ms ease',
@@ -228,23 +228,19 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
   );
   saveButton.type = 'button';
 
-  /* ---------- 历史记录 ---------- */
   const divider = el('hr', {
     margin: '20px 0 16px',
     border: 'none',
-    borderTop: `1px solid ${COLOR.border}`,
+    borderTopWidth: '1px',
+    borderTopStyle: 'solid',
   });
 
-  const historyTitle = el(
-    'h3',
-    { margin: '0 0 10px', fontSize: '14px', fontWeight: '600', color: COLOR.fg },
-    '历史记录',
-  );
+  const historyTitle = el('h3', { margin: '0 0 10px', fontSize: '14px', fontWeight: '600' }, '历史记录');
 
   const historyList = el('div', {
-    border: `1px solid ${COLOR.border}`,
+    borderWidth: '1px',
+    borderStyle: 'solid',
     borderRadius: '8px',
-    background: COLOR.panelBg,
     overflow: 'hidden',
   });
 
@@ -261,23 +257,52 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
   );
   container.appendChild(root);
 
-  /* ---------- 数据加载 ---------- */
-  async function loadConfig(): Promise<void> {
-    const result = await api.rpc<ConfigResponse>('GET', '/api/config');
-    baseUrlInput.value = typeof result.baseUrl === 'string' ? result.baseUrl : '';
-    authTokenInput.value = typeof result.authToken === 'string' ? result.authToken : '';
+  /* ---------- 状态提示 ---------- */
+  let statusKind: 'success' | 'error' | null = null;
+  let statusText = '';
+
+  function paintStatus(): void {
+    if (statusKind === null) {
+      status.style.display = 'none';
+      status.textContent = '';
+      return;
+    }
+    status.textContent = statusText;
+    status.style.display = 'block';
+    if (statusKind === 'success') {
+      status.style.background = palette.successBg;
+      status.style.borderColor = palette.successBorder;
+      status.style.color = palette.successFg;
+    } else {
+      status.style.background = palette.errorBg;
+      status.style.borderColor = palette.errorBorder;
+      status.style.color = palette.errorFg;
+    }
   }
 
+  function showStatus(kind: 'success' | 'error', message: string): void {
+    statusKind = kind;
+    statusText = message;
+    paintStatus();
+  }
+
+  function hideStatus(): void {
+    statusKind = null;
+    statusText = '';
+    paintStatus();
+  }
+
+  /* ---------- 历史列表 ---------- */
+  let historyItems: HistoryItem[] = [];
+
   function renderHistory(items: HistoryItem[]): void {
+    historyItems = items;
     historyList.replaceChildren();
 
     if (items.length === 0) {
-      const empty = el(
-        'div',
-        { padding: '14px', fontSize: '12px', color: COLOR.muted },
-        '暂无历史记录',
+      historyList.appendChild(
+        el('div', { padding: '14px', fontSize: '12px', color: palette.muted }, '暂无历史记录'),
       );
-      historyList.appendChild(empty);
       return;
     }
 
@@ -288,23 +313,19 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
         justifyContent: 'space-between',
         gap: '12px',
         padding: '9px 12px',
-        borderTop: index === 0 ? 'none' : `1px solid ${COLOR.border}`,
+        borderTopWidth: index === 0 ? '0' : '1px',
+        borderTopStyle: 'solid',
+        borderTopColor: palette.border,
       });
 
       const info = el('div', { minWidth: '0', flex: '1 1 auto' });
-
-      const time = el(
-        'div',
-        { fontSize: '12px', color: COLOR.fg, whiteSpace: 'nowrap' },
-        item.timestamp,
-      );
-
+      const time = el('div', { fontSize: '12px', color: palette.fg, whiteSpace: 'nowrap' }, item.timestamp);
       const url = el(
         'div',
         {
           fontSize: '11px',
           fontFamily: MONO,
-          color: COLOR.muted,
+          color: palette.muted,
           overflow: 'hidden',
           textOverflow: 'ellipsis',
           whiteSpace: 'nowrap',
@@ -312,7 +333,6 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
         item.baseUrl !== '' ? item.baseUrl : '(BASE_URL 为空)',
       );
       url.title = item.baseUrl;
-
       info.append(time, url);
 
       const restoreButton = el(
@@ -321,9 +341,11 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
           flex: '0 0 auto',
           padding: '5px 12px',
           fontSize: '12px',
-          color: COLOR.fg,
+          color: palette.fg,
           background: 'transparent',
-          border: `1px solid ${COLOR.border}`,
+          borderWidth: '1px',
+          borderStyle: 'solid',
+          borderColor: palette.border,
           borderRadius: '6px',
           cursor: 'pointer',
         },
@@ -337,6 +359,43 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
       row.append(info, restoreButton);
       historyList.appendChild(row);
     });
+  }
+
+  /* ---------- 主题应用 ---------- */
+  function applyTheme(): void {
+    root.style.color = palette.fg;
+    title.style.color = palette.fg;
+    subtitle.style.color = palette.muted;
+
+    baseUrlLabel.style.color = palette.muted;
+    authTokenLabel.style.color = palette.muted;
+
+    for (const input of [baseUrlInput, authTokenInput]) {
+      input.style.color = palette.fg;
+      input.style.background = palette.inputBg;
+      input.style.borderColor = palette.border;
+      input.style.caretColor = palette.fg;
+    }
+
+    saveButton.style.background = palette.accent;
+    saveButton.style.color = palette.accentFg;
+
+    divider.style.borderTopColor = palette.border;
+    historyTitle.style.color = palette.fg;
+    historyList.style.borderColor = palette.border;
+    historyList.style.background = palette.panelBg;
+
+    paintStatus();
+    renderHistory(historyItems);
+  }
+
+  applyTheme();
+
+  /* ---------- 数据加载 ---------- */
+  async function loadConfig(): Promise<void> {
+    const result = await api.rpc<ConfigResponse>('GET', '/api/config');
+    baseUrlInput.value = typeof result.baseUrl === 'string' ? result.baseUrl : '';
+    authTokenInput.value = typeof result.authToken === 'string' ? result.authToken : '';
   }
 
   async function loadHistory(): Promise<void> {
@@ -417,25 +476,27 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
   const onSaveClick = (): void => {
     void onSave();
   };
-  saveButton.addEventListener('click', onSaveClick);
-
   const onEnter = (event: KeyboardEvent): void => {
     if (event.key === 'Enter') {
       event.preventDefault();
       void onSave();
     }
   };
+  const onInput = (): void => hideStatus();
+
+  saveButton.addEventListener('click', onSaveClick);
   baseUrlInput.addEventListener('keydown', onEnter);
   authTokenInput.addEventListener('keydown', onEnter);
+  baseUrlInput.addEventListener('input', onInput);
+  authTokenInput.addEventListener('input', onInput);
 
-  const onBaseUrlInput = (): void => hideStatus();
-  baseUrlInput.addEventListener('input', onBaseUrlInput);
-  authTokenInput.addEventListener('input', onBaseUrlInput);
-
-  /* ---------- 上下文订阅 ---------- */
-  // 本插件不依赖上下文内容，仅保留订阅以便宿主切换主题/工作区时卸载时不残留监听
-  const unsubscribe = api.onContextChange(() => {
-    /* 无需响应，界面样式全部使用宿主 CSS 变量自动跟随主题 */
+  /* ---------- 上下文订阅（主题切换时重新着色） ---------- */
+  const unsubscribe = api.onContextChange((context: PluginContext) => {
+    const next: Theme = context.theme === 'light' ? 'light' : 'dark';
+    if (next === theme) return;
+    theme = next;
+    palette = PALETTES[theme];
+    applyTheme();
   });
 
   /* ---------- 首次加载 ---------- */
@@ -451,14 +512,18 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
       saveButton.removeEventListener('click', onSaveClick);
       baseUrlInput.removeEventListener('keydown', onEnter);
       authTokenInput.removeEventListener('keydown', onEnter);
-      baseUrlInput.removeEventListener('input', onBaseUrlInput);
-      authTokenInput.removeEventListener('input', onBaseUrlInput);
+      baseUrlInput.removeEventListener('input', onInput);
+      authTokenInput.removeEventListener('input', onInput);
       root.remove();
     },
   };
 }
 
-export function unmount(): void {
+/**
+ * 宿主在 tab 关闭 / 插件禁用 / 组件卸载时调用，并传入同一个 container。
+ * 参数可省略，便于本地调试。
+ */
+export function unmount(_container?: HTMLElement): void {
   if (mounted === null) return;
   mounted.destroy();
   mounted = null;
